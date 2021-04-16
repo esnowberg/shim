@@ -77,6 +77,7 @@ int loader_is_participating;
 
 UINT8 user_insecure_mode;
 UINT8 ignore_db;
+UINT8 trust_platform_keyring;
 
 typedef enum {
 	DATA_FOUND,
