@@ -47,6 +47,12 @@ typedef struct {
 } __attribute__ ((packed)) MokTPKvar;
 
 typedef struct {
+	UINT32 MokIMAState;
+	UINT32 PWLen;
+	CHAR16 Password[SB_PASSWORD_LEN];
+} __attribute__ ((packed)) MokIMAvar;
+
+typedef struct {
 	INT32 Timeout;
 } __attribute__ ((packed)) MokTimeoutvar;
 
@@ -1799,6 +1805,120 @@ static EFI_STATUS mok_tpk_prompt(void *MokTPK, UINTN MokTPKSize)
 	return EFI_SUCCESS;
 }
 
+static EFI_STATUS mok_ima_prompt(void *MokIMA, UINTN MokIMASize)
+{
+	EFI_STATUS efi_status;
+	SIMPLE_TEXT_OUTPUT_MODE SavedMode;
+	MokIMAvar *var = MokIMA;
+	CHAR16 *message[4];
+	CHAR16 pass1, pass2, pass3;
+	CHAR16 *str;
+	UINT8 fail_count = 0;
+	UINT8 dbval = 1;
+	UINT8 pos1, pos2, pos3;
+	int ret;
+	CHAR16 *disable_ima[] = { L"Disable loading the IMA Secure Boot specific policy", NULL };
+	CHAR16 *enable_ima[] = { L"Enable loading the IMA Secure Boot specific policy", NULL };
+
+	if (MokIMASize != sizeof(MokIMAvar)) {
+		console_notify(L"Invalid MokIMA variable contents");
+		return EFI_INVALID_PARAMETER;
+	}
+
+	ST->ConOut->ClearScreen(ST->ConOut);
+
+	message[0] = L"Change IMA Secure Boot specific policy state";
+	message[1] = NULL;
+
+	console_save_and_set_mode(&SavedMode);
+	console_print_box_at(message, -1, 0, 0, -1, -1, 1, 1);
+	console_restore_mode(&SavedMode);
+
+	while (fail_count < 3) {
+		RandomBytes(&pos1, sizeof(pos1));
+		pos1 = (pos1 % var->PWLen);
+
+		do {
+			RandomBytes(&pos2, sizeof(pos2));
+			pos2 = (pos2 % var->PWLen);
+		} while (pos2 == pos1);
+
+		do {
+			RandomBytes(&pos3, sizeof(pos3));
+			pos3 = (pos3 % var->PWLen);
+		} while (pos3 == pos2 || pos3 == pos1);
+
+		str = PoolPrint(L"Enter password character %d: ", pos1 + 1);
+		if (!str) {
+			console_errorbox(L"Failed to allocate buffer");
+			return EFI_OUT_OF_RESOURCES;
+		}
+		pass1 = get_password_charater(str);
+		FreePool(str);
+
+		str = PoolPrint(L"Enter password character %d: ", pos2 + 1);
+		if (!str) {
+			console_errorbox(L"Failed to allocate buffer");
+			return EFI_OUT_OF_RESOURCES;
+		}
+		pass2 = get_password_charater(str);
+		FreePool(str);
+
+		str = PoolPrint(L"Enter password character %d: ", pos3 + 1);
+		if (!str) {
+			console_errorbox(L"Failed to allocate buffer");
+			return EFI_OUT_OF_RESOURCES;
+		}
+		pass3 = get_password_charater(str);
+		FreePool(str);
+
+		if (pass1 != var->Password[pos1] ||
+		    pass2 != var->Password[pos2] ||
+		    pass3 != var->Password[pos3]) {
+			console_print(L"Invalid character\n");
+			fail_count++;
+		} else {
+			break;
+		}
+	}
+
+	if (fail_count >= 3) {
+		console_notify(L"Password limit reached");
+		return EFI_ACCESS_DENIED;
+	}
+
+	if (var->MokIMAState == 0)
+		ret = console_yes_no(enable_ima);
+	else
+		ret = console_yes_no(disable_ima);
+
+	if (ret == 0) {
+		LibDeleteVariable(L"MokIMA", &SHIM_LOCK_GUID);
+		return EFI_ABORTED;
+	}
+
+	if (var->MokIMAState == 0) {
+		efi_status = gRT->SetVariable(L"MokIMAState", &SHIM_LOCK_GUID,
+					      EFI_VARIABLE_NON_VOLATILE |
+					      EFI_VARIABLE_BOOTSERVICE_ACCESS,
+					      1, &dbval);
+		if (EFI_ERROR(efi_status)) {
+			console_notify(L"Failed to set IMA state");
+			return efi_status;
+		}
+	} else {
+		efi_status = gRT->SetVariable(L"MokIMAState", &SHIM_LOCK_GUID,
+					      EFI_VARIABLE_NON_VOLATILE |
+					      EFI_VARIABLE_BOOTSERVICE_ACCESS,
+					      0, NULL);
+		if (EFI_ERROR(efi_status)) {
+			console_notify(L"Failed to delete IMA state");
+			return efi_status;
+		}
+	}
+
+	return EFI_SUCCESS;
+}
 
 static EFI_STATUS mok_pw_prompt(void *MokPW, UINTN MokPWSize)
 {
@@ -2199,7 +2319,8 @@ typedef enum {
 	MOK_CHANGE_DB,
 	MOK_KEY_ENROLL,
 	MOK_HASH_ENROLL,
-	MOK_CHANGE_TPK
+	MOK_CHANGE_TPK,
+	MOK_CHANGE_IMA
 } mok_menu_item;
 
 static void free_menu(mok_menu_item * menu_item, CHAR16 ** menu_strings)
@@ -2219,7 +2340,8 @@ static EFI_STATUS enter_mok_menu(EFI_HANDLE image_handle UNUSED,
 				 void *MokDB, UINTN MokDBSize,
 				 void *MokXNew, UINTN MokXNewSize,
 				 void *MokXDel, UINTN MokXDelSize,
-				 void *MokTPK, UINTN MokTPKSize)
+				 void *MokTPK, UINTN MokTPKSize,
+				 void *MokIMA, UINTN MokIMASize)
 {
 	CHAR16 **menu_strings = NULL;
 	mok_menu_item *menu_item = NULL;
@@ -2298,6 +2420,9 @@ static EFI_STATUS enter_mok_menu(EFI_HANDLE image_handle UNUSED,
 		if (MokTPK)
 			menucount++;
 
+		if (MokIMA)
+			menucount++;
+
 		menu_strings = AllocateZeroPool(sizeof(CHAR16 *) *
 						(menucount + 1));
 		if (!menu_strings)
@@ -2372,6 +2497,12 @@ static EFI_STATUS enter_mok_menu(EFI_HANDLE image_handle UNUSED,
 		if (MokTPK) {
 			menu_strings[i] = L"Change Trusted Platform Keyring state";
 			menu_item[i] = MOK_CHANGE_TPK;
+			i++;
+		}
+
+		if (MokIMA) {
+			menu_strings[i] = L"Change the IMA Secure Boot policy state";
+			menu_item[i] = MOK_CHANGE_IMA;
 			i++;
 		}
 
@@ -2496,6 +2627,17 @@ static EFI_STATUS enter_mok_menu(EFI_HANDLE image_handle UNUSED,
 			if (!EFI_ERROR(efi_status))
 				MokTPK = NULL;
 			break;
+		case MOK_CHANGE_IMA:
+			if (!MokIMA) {
+				console_print(L"MokManager: internal error: %s",
+					L"MokIMA was !NULL bus is no NULL\n");
+				ret = EFI_ABORTED;
+				goto out;
+			}
+			efi_status = mok_ima_prompt(MokIMA, MokIMASize);
+			if (!EFI_ERROR(efi_status))
+				MokIMA = NULL;
+			break;
 		}
 
 		if (!EFI_ERROR(efi_status))
@@ -2521,6 +2663,7 @@ static EFI_STATUS check_mok_request(EFI_HANDLE image_handle)
 {
 	UINTN MokNewSize = 0, MokDelSize = 0, MokSBSize = 0, MokPWSize = 0;
 	UINTN MokDBSize = 0, MokXNewSize = 0, MokXDelSize = 0, MokTPKSize = 0;
+	UINTN MokIMASize = 0;
 	void *MokNew = NULL;
 	void *MokDel = NULL;
 	void *MokSB = NULL;
@@ -2529,6 +2672,7 @@ static EFI_STATUS check_mok_request(EFI_HANDLE image_handle)
 	void *MokXNew = NULL;
 	void *MokXDel = NULL;
 	void *MokTPK = NULL;
+	void *MokIMA = NULL;
 	EFI_STATUS efi_status;
 
 	efi_status = get_variable(L"MokNew", (UINT8 **) & MokNew, &MokNewSize,
@@ -2589,6 +2733,17 @@ static EFI_STATUS check_mok_request(EFI_HANDLE image_handle)
 			console_notify(L"Failed to delete MokTPK");
 	} else if (EFI_ERROR(efi_status) && efi_status != EFI_NOT_FOUND) {
 		console_error(L"Could not retrieve MokTPK", efi_status);
+
+	}
+
+	efi_status = get_variable(L"MokIMA", (UINT8 **) & MokIMA, &MokIMASize,
+				  SHIM_LOCK_GUID);
+	if (!EFI_ERROR(efi_status)) {
+		efi_status = LibDeleteVariable(L"MokIMA", &SHIM_LOCK_GUID);
+		if (EFI_ERROR(efi_status))
+			console_notify(L"Failed to delete MokIMA");
+	} else if (EFI_ERROR(efi_status) && efi_status != EFI_NOT_FOUND) {
+		console_error(L"Could not retrieve MokIMA", efi_status);
 	}
 
 	efi_status = get_variable(L"MokXNew", (UINT8 **) & MokXNew,
@@ -2613,7 +2768,8 @@ static EFI_STATUS check_mok_request(EFI_HANDLE image_handle)
 
 	enter_mok_menu(image_handle, MokNew, MokNewSize, MokDel, MokDelSize,
 		       MokSB, MokSBSize, MokPW, MokPWSize, MokDB, MokDBSize,
-		       MokXNew, MokXNewSize, MokXDel, MokXDelSize, MokTPK, MokTPKSize);
+		       MokXNew, MokXNewSize, MokXDel, MokXDelSize, MokTPK, MokTPKSize,
+		       MokIMA, MokIMASize);
 
 	if (MokNew)
 		FreePool(MokNew);
@@ -2638,6 +2794,9 @@ static EFI_STATUS check_mok_request(EFI_HANDLE image_handle)
 
 	if (MokTPK)
 		FreePool(MokTPK);
+
+	if (MokIMA)
+		FreePool(MokIMA);
 
 	LibDeleteVariable(L"MokAuth", &SHIM_LOCK_GUID);
 	LibDeleteVariable(L"MokDelAuth", &SHIM_LOCK_GUID);
